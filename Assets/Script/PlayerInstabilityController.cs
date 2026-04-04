@@ -8,14 +8,6 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(Rigidbody2D))]
 public class PlayerInstabilityController : MonoBehaviour
 {
-    // Kept for compatibility with existing scripts. Liquid/Gas are disabled.
-    public enum FormState
-    {
-        Solid,
-        Liquid,
-        Gas
-    }
-
     [Serializable]
     public class StateTuning
     {
@@ -57,6 +49,8 @@ public class PlayerInstabilityController : MonoBehaviour
     [Header("Respawn")]
     [SerializeField] private float killY = -9f;
     [SerializeField] private Vector3 respawnPosition = Vector3.zero;
+    [SerializeField] private bool useCurrentPositionAsInitialRespawn = true;
+    [SerializeField] private string checkpointTag = "Checkpoint";
 
     [Header("Visuals")]
     [SerializeField] private SpriteRenderer bodyRenderer;
@@ -68,7 +62,20 @@ public class PlayerInstabilityController : MonoBehaviour
     [SerializeField] private Animator bodyAnimator;
     [SerializeField] private string speedParam = "Speed";
     [SerializeField] private string groundedParam = "Grounded";
-    [SerializeField] private string formParam = "Form";
+
+    [Header("Slingshot")]
+    [SerializeField] private float launchForce = 25f;
+    [SerializeField] private float maxDragDistance = 4f;
+    [SerializeField] private float launchCooldown = 0.1f;
+    [SerializeField] private LineRenderer trajectoryLine;
+
+    [Header("Squash & Stretch")]
+    [SerializeField] private float squashAmount = 1.2f;
+    [SerializeField] private float stretchAmount = 0.8f;
+    [SerializeField] private float squashDuration = 0.2f;
+
+    [Header("Audio")]
+    [SerializeField] private AudioClip launchSound;
 
     [Header("HUD")]
     [SerializeField] private bool showInstabilityHud = true;
@@ -78,17 +85,10 @@ public class PlayerInstabilityController : MonoBehaviour
     [SerializeField, Range(10, 36)] private int hudFontSize = 16;
 
 #if ENABLE_INPUT_SYSTEM
-    [Header("Input Actions (Optional)")]
-    [SerializeField] private PlayerInput playerInput;
-    [SerializeField] private string moveActionName = "Move";
-    [SerializeField] private string jumpActionName = "Jump";
 #endif
-
-    public event Action<FormState, FormState> OnStateChanged;
 
     public float InstabilityValue => instabilityValue;
     public float InstabilityPercent => instabilityValue / 100f;
-    public FormState CurrentForm => FormState.Solid;
 
     public float SolidJumpPower
     {
@@ -96,32 +96,21 @@ public class PlayerInstabilityController : MonoBehaviour
         set => solid.jumpForce = Mathf.Max(0f, value);
     }
 
-    // Compatibility properties: map to solid jump power.
-    public float LiquidJumpPower
-    {
-        get => solid.jumpForce;
-        set => solid.jumpForce = Mathf.Max(0f, value);
-    }
-
-    public float GasJumpPower
-    {
-        get => solid.jumpForce;
-        set => solid.jumpForce = Mathf.Max(0f, value);
-    }
-
-    public bool CanPushHeavy => true;
-    public bool CanBreakFragilePlatforms => true;
-    public bool CanUseVentPassage => false;
-
     private Rigidbody2D rb;
     private Collider2D bodyCollider;
     private PhysicsMaterial2D defaultColliderMaterial;
-    private float horizontalInput;
-    private bool jumpPressed;
     private bool inputLocked;
     private bool isGrounded;
-    private bool groundJumpConsumed;
     private GUIStyle hudLabelStyle;
+    private Camera mainCam;
+    private Vector3 normalScale;
+    private AudioSource audioSource;
+    private float cooldownTimer;
+    private float squashTimer;
+    private Transform lastCheckpointTransform;
+
+    private bool isDragging;
+    private Vector2 dragStart;
 
 #if ENABLE_INPUT_SYSTEM
     private InputAction moveAction;
@@ -133,8 +122,11 @@ public class PlayerInstabilityController : MonoBehaviour
     private void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
+        rb.freezeRotation = true;
         bodyCollider = GetComponent<Collider2D>();
         defaultColliderMaterial = bodyCollider != null ? bodyCollider.sharedMaterial : null;
+        mainCam = Camera.main;
+        normalScale = transform.localScale;
 
         if (bodyRenderer == null)
         {
@@ -146,9 +138,34 @@ public class PlayerInstabilityController : MonoBehaviour
             bodyAnimator = GetComponentInChildren<Animator>();
         }
 
-#if ENABLE_INPUT_SYSTEM
-        CacheInputActions();
-#endif
+        if (useCurrentPositionAsInitialRespawn)
+        {
+            respawnPosition = transform.position;
+        }
+
+        audioSource = GetComponent<AudioSource>();
+        if (audioSource == null)
+            audioSource = gameObject.AddComponent<AudioSource>();
+        audioSource.playOnAwake = false;
+        audioSource.loop = false;
+        audioSource.volume = 0.3f;
+
+        if (FindFirstObjectByType<AudioListener>() == null)
+        {
+            if (mainCam != null)
+                mainCam.gameObject.AddComponent<AudioListener>();
+        }
+
+        if (trajectoryLine == null)
+        {
+            trajectoryLine = gameObject.AddComponent<LineRenderer>();
+            trajectoryLine.startWidth = 0.1f;
+            trajectoryLine.endWidth = 0.2f;
+            trajectoryLine.material = new Material(Shader.Find("Sprites/Default"));
+            trajectoryLine.startColor = Color.red;
+            trajectoryLine.endColor = Color.yellow;
+        }
+        trajectoryLine.positionCount = 0;
 
         ApplySolidTuning();
         ApplySolidVisuals();
@@ -156,39 +173,39 @@ public class PlayerInstabilityController : MonoBehaviour
 
     private void Update()
     {
+        if (cooldownTimer > 0f)
+            cooldownTimer -= Time.deltaTime;
+
+        if (squashTimer > 0f)
+        {
+            squashTimer -= Time.deltaTime;
+            float progress = squashTimer / squashDuration;
+            float scale = Mathf.Lerp(1f, squashAmount, progress);
+            transform.localScale = new Vector3(normalScale.x * scale, normalScale.y / scale, normalScale.z);
+        }
+        else
+        {
+            transform.localScale = normalScale;
+        }
+
         CheckFallDeath();
-        HandleInput();
+        HandleSlingshotInput();
         UpdateInstability(Time.deltaTime);
-        UpdateAnimatorParameters();
     }
 
     private void FixedUpdate()
     {
         isGrounded = IsGrounded();
-
-        if (isGrounded && rb.linearVelocity.y <= 0.05f)
-        {
-            groundJumpConsumed = false;
-        }
-
-        ApplyHorizontalMovement(Time.fixedDeltaTime);
-        TryConsumeJump();
     }
 
-    public bool TrySwitchState(FormState newForm)
+    public void SetCheckpoint(Vector3 checkpointPosition)
     {
-        // Liquid/Gas system removed by request.
-        return false;
+        respawnPosition = checkpointPosition;
     }
 
-    public void SetJumpPower(FormState form, float jumpPower)
+    public void ForceRespawn()
     {
-        solid.jumpForce = Mathf.Max(0f, jumpPower);
-    }
-
-    public float GetJumpPower(FormState form)
-    {
-        return solid.jumpForce;
+        RespawnPlayer();
     }
 
     private void ApplySolidTuning()
@@ -217,130 +234,116 @@ public class PlayerInstabilityController : MonoBehaviour
         }
     }
 
-    private void HandleInput()
+    private void HandleSlingshotInput()
     {
         if (inputLocked)
-        {
-            horizontalInput = 0f;
-            jumpPressed = false;
             return;
-        }
 
-        horizontalInput = ReadHorizontalInput();
-        jumpPressed |= ReadJumpPressed();
-    }
-
-    private float ReadHorizontalInput()
-    {
 #if ENABLE_INPUT_SYSTEM
-        if (moveAction != null)
-        {
-            Vector2 moveVector = moveAction.ReadValue<Vector2>();
-            if (Mathf.Abs(moveVector.x) > MinMoveThreshold)
-            {
-                return Mathf.Clamp(moveVector.x, -1f, 1f);
-            }
+        if (Mouse.current == null) return;
 
-            float moveAxis = moveAction.ReadValue<float>();
-            if (Mathf.Abs(moveAxis) > MinMoveThreshold)
-            {
-                return Mathf.Clamp(moveAxis, -1f, 1f);
-            }
+        Vector2 mouseWorld = mainCam.ScreenToWorldPoint(Mouse.current.position.ReadValue());
+
+        if (Mouse.current.leftButton.wasPressedThisFrame && cooldownTimer <= 0f)
+        {
+            isDragging = true;
+            dragStart = mouseWorld;
         }
 
-        float axis = 0f;
-        if (Keyboard.current != null)
+        if (isDragging)
         {
-            if (Keyboard.current.aKey.isPressed || Keyboard.current.leftArrowKey.isPressed)
-            {
-                axis -= 1f;
-            }
+            Vector2 dragCurrent = mouseWorld;
+            Vector2 dragDelta = dragStart - dragCurrent;
 
-            if (Keyboard.current.dKey.isPressed || Keyboard.current.rightArrowKey.isPressed)
-            {
-                axis += 1f;
-            }
+            if (dragDelta.magnitude > maxDragDistance)
+                dragDelta = dragDelta.normalized * maxDragDistance;
+
+            Vector2 launchDir = dragDelta.normalized;
+            float power = (dragDelta.magnitude / maxDragDistance) * launchForce;
+
+            trajectoryLine.positionCount = 2;
+            trajectoryLine.SetPosition(0, (Vector2)transform.position);
+            trajectoryLine.SetPosition(1, (Vector2)transform.position + launchDir * (power / launchForce) * 2f);
         }
 
-        if (Mathf.Abs(axis) > MinMoveThreshold)
+        if (Mouse.current.leftButton.wasReleasedThisFrame && isDragging)
         {
-            return Mathf.Clamp(axis, -1f, 1f);
+            isDragging = false;
+            trajectoryLine.positionCount = 0;
+
+            Vector2 dragEnd = mouseWorld;
+            Vector2 dragDelta = dragStart - dragEnd;
+
+            if (dragDelta.magnitude > maxDragDistance)
+                dragDelta = dragDelta.normalized * maxDragDistance;
+
+            float power = (dragDelta.magnitude / maxDragDistance) * launchForce;
+            Vector2 launchDir = dragDelta.normalized;
+
+            rb.linearVelocity = Vector2.zero;
+            rb.AddForce(launchDir * power, ForceMode2D.Impulse);
+
+            if (launchSound != null && audioSource != null)
+                audioSource.PlayOneShot(launchSound);
+
+            squashTimer = squashDuration;
+
+            float chargePercent = dragDelta.magnitude / maxDragDistance;
+            instabilityValue = Mathf.Min(100f, instabilityValue + (chargePercent * 30f));
+
+            cooldownTimer = launchCooldown;
         }
-
-        if (Gamepad.current != null)
-        {
-            float gamepadAxis = Gamepad.current.leftStick.ReadValue().x;
-            if (Mathf.Abs(gamepadAxis) <= MinMoveThreshold)
-            {
-                gamepadAxis = Gamepad.current.dpad.ReadValue().x;
-            }
-
-            return Mathf.Abs(gamepadAxis) <= MinMoveThreshold ? 0f : Mathf.Clamp(gamepadAxis, -1f, 1f);
-        }
-
-        return 0f;
 #else
-        return Input.GetAxisRaw("Horizontal");
+        Vector2 mouseWorld = mainCam.ScreenToWorldPoint(Input.mousePosition);
+
+        if (Input.GetMouseButtonDown(0) && cooldownTimer <= 0f)
+        {
+            isDragging = true;
+            dragStart = mouseWorld;
+        }
+
+        if (isDragging)
+        {
+            Vector2 dragCurrent = mouseWorld;
+            Vector2 dragDelta = dragStart - dragCurrent;
+
+            if (dragDelta.magnitude > maxDragDistance)
+                dragDelta = dragDelta.normalized * maxDragDistance;
+
+            Vector2 launchDir = dragDelta.normalized;
+            float power = (dragDelta.magnitude / maxDragDistance) * launchForce;
+
+            trajectoryLine.positionCount = 2;
+            trajectoryLine.SetPosition(0, (Vector2)transform.position);
+            trajectoryLine.SetPosition(1, (Vector2)transform.position + launchDir * (power / launchForce) * 2f);
+        }
+
+        if (Input.GetMouseButtonUp() && isDragging)
+        {
+            isDragging = false;
+            trajectoryLine.positionCount = 0;
+
+            Vector2 dragEnd = mouseWorld;
+            Vector2 dragDelta = dragStart - dragEnd;
+
+            if (dragDelta.magnitude > maxDragDistance)
+                dragDelta = dragDelta.normalized * maxDragDistance;
+
+            float power = (dragDelta.magnitude / maxDragDistance) * launchForce;
+            Vector2 launchDir = dragDelta.normalized;
+
+            rb.linearVelocity = Vector2.zero;
+            rb.AddForce(launchDir * power, ForceMode2D.Impulse);
+
+            if (launchSound != null && audioSource != null)
+                audioSource.PlayOneShot(launchSound);
+
+            squashTimer = squashDuration;
+            float chargePercent = dragDelta.magnitude / maxDragDistance;
+            instabilityValue = Mathf.Min(100f, instabilityValue + (chargePercent * 30f));
+            cooldownTimer = launchCooldown;
+        }
 #endif
-    }
-
-    private bool ReadJumpPressed()
-    {
-#if ENABLE_INPUT_SYSTEM
-        if (jumpAction != null && jumpAction.WasPressedThisFrame())
-        {
-            return true;
-        }
-
-        bool keyboardJump = Keyboard.current != null &&
-            (Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.upArrowKey.wasPressedThisFrame);
-        bool gamepadJump = Gamepad.current != null && Gamepad.current.buttonSouth.wasPressedThisFrame;
-        return keyboardJump || gamepadJump;
-#else
-        return Input.GetButtonDown("Jump");
-#endif
-    }
-
-#if ENABLE_INPUT_SYSTEM
-    private void CacheInputActions()
-    {
-        if (playerInput == null)
-        {
-            playerInput = GetComponent<PlayerInput>();
-        }
-
-        if (playerInput == null || playerInput.actions == null)
-        {
-            return;
-        }
-
-        moveAction = playerInput.actions.FindAction(moveActionName, false);
-        jumpAction = playerInput.actions.FindAction(jumpActionName, false);
-    }
-#endif
-
-    private void ApplyHorizontalMovement(float dt)
-    {
-        float targetX = horizontalInput * solid.moveSpeed;
-        rb.linearVelocity = new Vector2(targetX, rb.linearVelocity.y);
-    }
-
-    private void TryConsumeJump()
-    {
-        if (!jumpPressed)
-        {
-            return;
-        }
-
-        jumpPressed = false;
-
-        if (!isGrounded || groundJumpConsumed)
-        {
-            return;
-        }
-
-        groundJumpConsumed = true;
-        rb.linearVelocity = new Vector2(rb.linearVelocity.x, solid.jumpForce);
     }
 
     private bool IsGrounded()
@@ -361,16 +364,7 @@ public class PlayerInstabilityController : MonoBehaviour
 
     private void UpdateInstability(float dt)
     {
-        if (!isGrounded)
-        {
-            return;
-        }
-
-        bool standingStill = Mathf.Abs(horizontalInput) <= MinMoveThreshold
-            && Mathf.Abs(rb.linearVelocity.x) <= MinMoveThreshold
-            && Mathf.Abs(rb.linearVelocity.y) <= MinMoveThreshold;
-
-        if (standingStill)
+        if (isGrounded)
         {
             instabilityValue = Mathf.Max(0f, instabilityValue - instabilityCooldownPerSecond * dt);
         }
@@ -386,43 +380,113 @@ public class PlayerInstabilityController : MonoBehaviour
         RespawnPlayer();
     }
 
+    private void OnTriggerEnter2D(Collider2D other)
+    {
+        TrySetCheckpointFromCollider(other);
+    }
+
+    private void OnTriggerStay2D(Collider2D other)
+    {
+        TrySetCheckpointFromCollider(other);
+    }
+
+    private void OnCollisionEnter2D(Collision2D collision)
+    {
+        TrySetCheckpointFromCollision(collision);
+    }
+
+    private void OnCollisionStay2D(Collision2D collision)
+    {
+        TrySetCheckpointFromCollision(collision);
+    }
+
+    private void TrySetCheckpointFromCollider(Collider2D other)
+    {
+        if (other == null)
+        {
+            return;
+        }
+
+        TrySetCheckpointFromObject(other.gameObject);
+
+        if (other.attachedRigidbody != null)
+        {
+            TrySetCheckpointFromObject(other.attachedRigidbody.gameObject);
+        }
+    }
+
+    private void TrySetCheckpointFromCollision(Collision2D collision)
+    {
+        if (collision == null)
+        {
+            return;
+        }
+
+        TrySetCheckpointFromObject(collision.gameObject);
+
+        if (collision.rigidbody != null)
+        {
+            TrySetCheckpointFromObject(collision.rigidbody.gameObject);
+        }
+    }
+
+    private void TrySetCheckpointFromObject(GameObject candidate)
+    {
+        if (candidate == null || string.IsNullOrWhiteSpace(checkpointTag))
+        {
+            return;
+        }
+
+        if (candidate.CompareTag(checkpointTag))
+        {
+            SetCheckpointFromTransform(candidate.transform);
+            return;
+        }
+
+        Transform candidateTransform = candidate.transform;
+        if (candidateTransform.parent != null && candidateTransform.parent.CompareTag(checkpointTag))
+        {
+            SetCheckpointFromTransform(candidateTransform.parent);
+            return;
+        }
+
+        Transform root = candidateTransform.root;
+        if (root != null && root != candidateTransform && root.CompareTag(checkpointTag))
+        {
+            SetCheckpointFromTransform(root);
+        }
+    }
+
+    private void SetCheckpointFromTransform(Transform checkpointTransform)
+    {
+        if (checkpointTransform == null)
+        {
+            return;
+        }
+
+        if (lastCheckpointTransform == checkpointTransform)
+        {
+            return;
+        }
+
+        lastCheckpointTransform = checkpointTransform;
+        SetCheckpoint(checkpointTransform.position);
+    }
+
     private void RespawnPlayer()
     {
         rb.linearVelocity = Vector2.zero;
         rb.angularVelocity = 0f;
         rb.position = respawnPosition;
         transform.position = respawnPosition;
+        transform.localScale = normalScale;
 
         instabilityValue = 0f;
-        horizontalInput = 0f;
-        jumpPressed = false;
+        isDragging = false;
         isGrounded = false;
-        groundJumpConsumed = false;
-
-        OnStateChanged?.Invoke(FormState.Solid, FormState.Solid);
-    }
-
-    private void UpdateAnimatorParameters()
-    {
-        if (!driveAnimator || bodyAnimator == null)
-        {
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(speedParam))
-        {
-            bodyAnimator.SetFloat(speedParam, Mathf.Abs(rb.linearVelocity.x));
-        }
-
-        if (!string.IsNullOrEmpty(groundedParam))
-        {
-            bodyAnimator.SetBool(groundedParam, isGrounded);
-        }
-
-        if (!string.IsNullOrEmpty(formParam))
-        {
-            bodyAnimator.SetInteger(formParam, (int)FormState.Solid);
-        }
+        squashTimer = 0f;
+        cooldownTimer = 0f;
+        trajectoryLine.positionCount = 0;
     }
 
     private void OnDrawGizmosSelected()
