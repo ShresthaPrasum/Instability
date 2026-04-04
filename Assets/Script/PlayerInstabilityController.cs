@@ -8,6 +8,14 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(Rigidbody2D))]
 public class PlayerInstabilityController : MonoBehaviour
 {
+    public event Action<Vector3> OnRespawn;
+
+    public enum FormState
+    {
+        Solid,
+        Liquid
+    }
+
     [Serializable]
     public class StateTuning
     {
@@ -89,6 +97,7 @@ public class PlayerInstabilityController : MonoBehaviour
 
     public float InstabilityValue => instabilityValue;
     public float InstabilityPercent => instabilityValue / 100f;
+    public FormState CurrentForm => FormState.Solid;
 
     public float SolidJumpPower
     {
@@ -104,6 +113,7 @@ public class PlayerInstabilityController : MonoBehaviour
     private GUIStyle hudLabelStyle;
     private Camera mainCam;
     private Vector3 normalScale;
+    private Vector3 startRespawnPosition;
     private AudioSource audioSource;
     private float cooldownTimer;
     private float squashTimer;
@@ -143,6 +153,8 @@ public class PlayerInstabilityController : MonoBehaviour
             respawnPosition = transform.position;
         }
 
+        startRespawnPosition = respawnPosition;
+
         audioSource = GetComponent<AudioSource>();
         if (audioSource == null)
             audioSource = gameObject.AddComponent<AudioSource>();
@@ -180,8 +192,9 @@ public class PlayerInstabilityController : MonoBehaviour
         {
             squashTimer -= Time.deltaTime;
             float progress = squashTimer / squashDuration;
-            float scale = Mathf.Lerp(1f, squashAmount, progress);
-            transform.localScale = new Vector3(normalScale.x * scale, normalScale.y / scale, normalScale.z);
+            float squashX = Mathf.Lerp(1f, squashAmount, progress);
+            float squashY = Mathf.Lerp(1f, stretchAmount, progress);
+            transform.localScale = new Vector3(normalScale.x * squashX, normalScale.y * squashY, normalScale.z);
         }
         else
         {
@@ -191,6 +204,19 @@ public class PlayerInstabilityController : MonoBehaviour
         CheckFallDeath();
         HandleSlingshotInput();
         UpdateInstability(Time.deltaTime);
+        UpdateAnimation();
+    }
+
+    private void UpdateAnimation()
+    {
+        if (!driveAnimator || bodyAnimator == null)
+        {
+            return;
+        }
+
+        float speed = rb != null ? Mathf.Abs(rb.linearVelocity.x) : 0f;
+        bodyAnimator.SetFloat(speedParam, speed);
+        bodyAnimator.SetBool(groundedParam, isGrounded);
     }
 
     private void FixedUpdate()
@@ -206,6 +232,11 @@ public class PlayerInstabilityController : MonoBehaviour
     public void ForceRespawn()
     {
         RespawnPlayer();
+    }
+
+    public void ForceRespawnFromStart()
+    {
+        RespawnPlayer(startRespawnPosition);
     }
 
     private void ApplySolidTuning()
@@ -475,10 +506,15 @@ public class PlayerInstabilityController : MonoBehaviour
 
     private void RespawnPlayer()
     {
+        RespawnPlayer(respawnPosition);
+    }
+
+    private void RespawnPlayer(Vector3 targetPosition)
+    {
         rb.linearVelocity = Vector2.zero;
         rb.angularVelocity = 0f;
-        rb.position = respawnPosition;
-        transform.position = respawnPosition;
+        rb.position = targetPosition;
+        transform.position = targetPosition;
         transform.localScale = normalScale;
 
         instabilityValue = 0f;
@@ -487,6 +523,8 @@ public class PlayerInstabilityController : MonoBehaviour
         squashTimer = 0f;
         cooldownTimer = 0f;
         trajectoryLine.positionCount = 0;
+
+        OnRespawn?.Invoke(targetPosition);
     }
 
     private void OnDrawGizmosSelected()
