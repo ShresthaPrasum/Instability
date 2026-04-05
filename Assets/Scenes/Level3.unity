@@ -777,7 +777,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SpikeMoveOnTouch
   activationObject: {fileID: 1864931871}
   triggerTag: Player
-  movementStartDelay: 4
+  movementStartDelay: 5
   moveOffset: {x: 100, y: 0, z: 0}
   moveSpeed: 5
   moveInLocalSpace: 0
