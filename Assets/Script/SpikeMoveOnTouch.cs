@@ -5,6 +5,7 @@ public class SpikeMoveOnTouch : MonoBehaviour
     [Header("Activation")]
     [SerializeField] private GameObject activationObject;
     [SerializeField] private string triggerTag = "Player";
+    [SerializeField, Min(0f)] private float movementStartDelay = 0f;
 
     [Header("Movement")]
     [SerializeField] private Vector3 moveOffset = new Vector3(0f, 3f, 0f);
@@ -20,8 +21,10 @@ public class SpikeMoveOnTouch : MonoBehaviour
     private Vector3 startPosition;
     private Vector3 targetPosition;
     private bool hasStartedMoving;
+    private bool waitingToStartMoving;
     private bool hasDisappeared;
     private float disappearTimer;
+    private float movementStartTimer;
     private Renderer[] cachedRenderers;
     private Collider[] cachedColliders3D;
     private Collider2D[] cachedColliders2D;
@@ -33,8 +36,10 @@ public class SpikeMoveOnTouch : MonoBehaviour
         startPosition = transform.position;
         targetPosition = moveInLocalSpace ? startPosition + transform.TransformVector(moveOffset) : startPosition + moveOffset;
         hasStartedMoving = false;
+        waitingToStartMoving = false;
         hasDisappeared = false;
         disappearTimer = 0f;
+        movementStartTimer = 0f;
 
         cachedRenderers = GetComponentsInChildren<Renderer>(true);
         cachedColliders3D = GetComponentsInChildren<Collider>(true);
@@ -80,6 +85,17 @@ public class SpikeMoveOnTouch : MonoBehaviour
             return;
         }
 
+        if (waitingToStartMoving)
+        {
+            movementStartTimer += Time.deltaTime;
+            if (movementStartTimer >= movementStartDelay)
+            {
+                waitingToStartMoving = false;
+                hasStartedMoving = true;
+                movementStartTimer = 0f;
+            }
+        }
+
         if (hasStartedMoving)
         {
             transform.position = Vector3.MoveTowards(transform.position, targetPosition, moveSpeed * Time.deltaTime);
@@ -103,7 +119,18 @@ public class SpikeMoveOnTouch : MonoBehaviour
         }
 
         EnableSpikeVisualsAndColliders(true);
-        hasStartedMoving = true;
+
+        if (movementStartDelay <= 0f)
+        {
+            hasStartedMoving = true;
+            waitingToStartMoving = false;
+            movementStartTimer = 0f;
+            return;
+        }
+
+        waitingToStartMoving = true;
+        hasStartedMoving = false;
+        movementStartTimer = 0f;
     }
 
     private void HandlePlayerRespawned(Vector3 respawnPosition)
@@ -111,8 +138,10 @@ public class SpikeMoveOnTouch : MonoBehaviour
         transform.position = startPosition;
         targetPosition = moveInLocalSpace ? startPosition + transform.TransformVector(moveOffset) : startPosition + moveOffset;
         hasStartedMoving = false;
+        waitingToStartMoving = false;
         hasDisappeared = false;
         disappearTimer = 0f;
+        movementStartTimer = 0f;
 
         EnableSpikeVisualsAndColliders(false);
     }
